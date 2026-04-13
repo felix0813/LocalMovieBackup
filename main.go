@@ -28,6 +28,7 @@ const apiPrefix = "/movieBackup"
 type Config struct {
 	Port            string
 	OSSEndpoint     string
+	OSSRegion       string
 	OSSBucket       string
 	OSSAccessKeyID  string
 	OSSAccessSecret string
@@ -91,6 +92,7 @@ func loadConfig() (Config, error) {
 	cfg := Config{
 		Port:            envOrDefault("PORT", "8080"),
 		OSSEndpoint:     strings.TrimSpace(os.Getenv("OSS_ENDPOINT")),
+		OSSRegion:       strings.TrimSpace(os.Getenv("OSS_REGION")),
 		OSSBucket:       strings.TrimSpace(os.Getenv("OSS_BUCKET")),
 		OSSAccessKeyID:  strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_ID")),
 		OSSAccessSecret: strings.TrimSpace(os.Getenv("OSS_ACCESS_KEY_SECRET")),
@@ -106,8 +108,16 @@ func loadConfig() (Config, error) {
 	if !strings.HasSuffix(cfg.OSSPrefix, "/") {
 		cfg.OSSPrefix += "/"
 	}
-	log.Printf("config loaded: port=%s oss_bucket=%s oss_endpoint=%s prefix=%s max_upload_mb=%d",
-		cfg.Port, cfg.OSSBucket, cfg.OSSEndpoint, cfg.OSSPrefix, cfg.MaxUploadMB)
+	if cfg.OSSRegion == "" {
+		if region, err := inferOSSRegion(cfg.OSSEndpoint); err == nil {
+			cfg.OSSRegion = region
+		} else {
+			log.Printf("config parse error: infer OSS region failed endpoint=%q err=%v", cfg.OSSEndpoint, err)
+			return Config{}, errors.New("invalid OSS endpoint: cannot infer region, set OSS_REGION explicitly")
+		}
+	}
+	log.Printf("config loaded: port=%s oss_bucket=%s oss_endpoint=%s oss_region=%s prefix=%s max_upload_mb=%d",
+		cfg.Port, cfg.OSSBucket, cfg.OSSEndpoint, cfg.OSSRegion, cfg.OSSPrefix, cfg.MaxUploadMB)
 
 	return cfg, nil
 }
@@ -424,6 +434,7 @@ func NewOSSClient(cfg Config) (*OSSClient, error) {
 
 	ossCfg := oss.LoadDefaultConfig().
 		WithCredentialsProvider(credentials.NewEnvironmentVariableCredentialsProvider()).
+		WithRegion(cfg.OSSRegion).
 		WithEndpoint(endpoint)
 	client := oss.NewClient(ossCfg)
 
@@ -516,6 +527,29 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func inferOSSRegion(endpoint string) (string, error) {
+	host := strings.TrimSpace(endpoint)
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.Split(host, "/")[0]
+	if host == "" {
+		return "", errors.New("empty endpoint")
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 1 {
+		return "", errors.New("invalid endpoint host")
+	}
+	segment := parts[0]
+	if !strings.HasPrefix(segment, "oss-") {
+		return "", fmt.Errorf("unsupported endpoint host %q", host)
+	}
+	region := strings.TrimPrefix(segment, "oss-")
+	if region == "" {
+		return "", fmt.Errorf("missing region in endpoint host %q", host)
+	}
+	return region, nil
 }
 func sanitizeName(v string) string {
 	v = strings.TrimSpace(strings.ReplaceAll(v, " ", "-"))
