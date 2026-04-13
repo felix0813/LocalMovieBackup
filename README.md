@@ -24,6 +24,7 @@
 
 - `PORT`：服务端口（默认 `8080`）
 - `OSS_ENDPOINT`：OSS Endpoint
+- `OSS_REGION`：OSS Region（可选，未配置时会从 `OSS_ENDPOINT` 自动推断，例如 `oss-cn-wulanchabu-internal.aliyuncs.com` 会推断为 `cn-wulanchabu`）
 - `OSS_BUCKET`：OSS Bucket 名
 - `OSS_ACCESS_KEY_ID`：AccessKey ID
 - `OSS_ACCESS_KEY_SECRET`：AccessKey Secret
