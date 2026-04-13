@@ -102,6 +102,7 @@ func loadConfig() (Config, error) {
 	if v := strings.TrimSpace(os.Getenv("MAX_UPLOAD_MB")); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil || n <= 0 {
+			log.Printf("config parse error: invalid MAX_UPLOAD_MB=%q", v)
 			return Config{}, fmt.Errorf("invalid MAX_UPLOAD_MB")
 		}
 		maxMB = n
@@ -118,17 +119,22 @@ func loadConfig() (Config, error) {
 	}
 
 	if cfg.OSSEndpoint == "" || cfg.OSSBucket == "" || cfg.OSSAccessKeyID == "" || cfg.OSSAccessSecret == "" {
+		log.Printf("config validation failed: required OSS env missing endpoint=%t bucket=%t accessKeyID=%t secret=%t",
+			cfg.OSSEndpoint != "", cfg.OSSBucket != "", cfg.OSSAccessKeyID != "", cfg.OSSAccessSecret != "")
 		return Config{}, errors.New("OSS_ENDPOINT, OSS_BUCKET, OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET are required")
 	}
 	if !strings.HasSuffix(cfg.OSSPrefix, "/") {
 		cfg.OSSPrefix += "/"
 	}
+	log.Printf("config loaded: port=%s oss_bucket=%s oss_endpoint=%s prefix=%s max_upload_mb=%d",
+		cfg.Port, cfg.OSSBucket, cfg.OSSEndpoint, cfg.OSSPrefix, cfg.MaxUploadMB)
 
 	return cfg, nil
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
 	if err := s.client.CheckConnection(s.cfg.OSSPrefix); err != nil {
+		log.Printf("healthz degraded: oss unreachable prefix=%s err=%v", s.cfg.OSSPrefix, err)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
 			"status": "degraded",
 			"oss":    "unreachable",
@@ -155,27 +161,33 @@ func (s *Server) backupsEntry(w http.ResponseWriter, r *http.Request) {
 func (s *Server) uploadBackup(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxUploadMB*1024*1024)
 	if err := r.ParseMultipartForm(s.cfg.MaxUploadMB * 1024 * 1024); err != nil {
+		log.Printf("upload request parse failed: err=%v max_upload_mb=%d", err, s.cfg.MaxUploadMB)
 		writeError(w, http.StatusBadRequest, "invalid multipart form or payload too large")
 		return
 	}
 	name := strings.TrimSpace(r.FormValue("name"))
 	if name == "" {
+		log.Printf("upload validation failed: empty name")
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
 	if !regexp.MustCompile(`^[\w\-\u4e00-\u9fa5 ]{1,64}$`).MatchString(name) {
+		log.Printf("upload validation failed: invalid name=%q", name)
 		writeError(w, http.StatusBadRequest, "name must be 1-64 chars and contains letters, numbers, spaces, -, _")
 		return
 	}
+	log.Printf("upload started: name=%q", name)
 
 	sqliteFile, sqliteHeader, err := r.FormFile("sqlite")
 	if err != nil {
+		log.Printf("upload validation failed: sqlite form file missing, err=%v", err)
 		writeError(w, http.StatusBadRequest, "sqlite file is required (field: sqlite)")
 		return
 	}
 	defer sqliteFile.Close()
 	jsonFile, jsonHeader, err := r.FormFile("json")
 	if err != nil {
+		log.Printf("upload validation failed: json form file missing, err=%v", err)
 		writeError(w, http.StatusBadRequest, "json file is required (field: json)")
 		return
 	}
@@ -183,6 +195,7 @@ func (s *Server) uploadBackup(w http.ResponseWriter, r *http.Request) {
 
 	archiveData, archiveName, err := buildArchive(name, sqliteHeader, sqliteFile, jsonHeader, jsonFile)
 	if err != nil {
+		log.Printf("build archive failed: name=%q sqlite=%q json=%q err=%v", name, sqliteHeader.Filename, jsonHeader.Filename, err)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -197,9 +210,11 @@ func (s *Server) uploadBackup(w http.ResponseWriter, r *http.Request) {
 		"x-oss-meta-backup-id":         id,
 	}
 	if err := s.client.PutObject(key, archiveData, "application/zip", meta); err != nil {
+		log.Printf("upload to OSS failed: key=%s err=%v", key, err)
 		writeError(w, http.StatusInternalServerError, "upload to OSS failed")
 		return
 	}
+	log.Printf("upload completed: id=%s key=%s archive_name=%s size=%d", id, key, archiveName, len(archiveData))
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":         id,
@@ -211,15 +226,19 @@ func (s *Server) uploadBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func buildArchive(name string, sqliteHeader *multipart.FileHeader, sqliteFile multipart.File, jsonHeader *multipart.FileHeader, jsonFile multipart.File) ([]byte, string, error) {
+	log.Printf("build archive started: name=%q sqlite=%q json=%q", name, sqliteHeader.Filename, jsonHeader.Filename)
 	sqliteData, err := io.ReadAll(sqliteFile)
 	if err != nil {
+		log.Printf("read sqlite failed: file=%q err=%v", sqliteHeader.Filename, err)
 		return nil, "", errors.New("read sqlite failed")
 	}
 	jsonData, err := io.ReadAll(jsonFile)
 	if err != nil {
+		log.Printf("read json failed: file=%q err=%v", jsonHeader.Filename, err)
 		return nil, "", errors.New("read json failed")
 	}
 	if !json.Valid(jsonData) {
+		log.Printf("json validation failed: file=%q", jsonHeader.Filename)
 		return nil, "", errors.New("json file is not valid JSON")
 	}
 	buf := bytes.NewBuffer(nil)
@@ -245,9 +264,12 @@ func buildArchive(name string, sqliteHeader *multipart.FileHeader, sqliteFile mu
 		return nil, "", err
 	}
 	if err := zw.Close(); err != nil {
+		log.Printf("zip close failed: name=%q err=%v", name, err)
 		return nil, "", errors.New("build zip failed")
 	}
-	return buf.Bytes(), fmt.Sprintf("%s-%s.zip", time.Now().UTC().Format("20060102T150405Z"), sanitizeName(name)), nil
+	archiveName := fmt.Sprintf("%s-%s.zip", time.Now().UTC().Format("20060102T150405Z"), sanitizeName(name))
+	log.Printf("build archive completed: name=%q archive_name=%s size=%d", name, archiveName, buf.Len())
+	return buf.Bytes(), archiveName, nil
 }
 
 func addZipFile(zw *zip.Writer, name string, content []byte) error {
@@ -264,9 +286,11 @@ func addZipFile(zw *zip.Writer, name string, content []byte) error {
 func (s *Server) listBackups(w http.ResponseWriter) {
 	marker := ""
 	items := make([]BackupItem, 0)
+	log.Printf("list backups started: prefix=%s", s.cfg.OSSPrefix)
 	for {
 		res, err := s.client.ListObjects(s.cfg.OSSPrefix, marker, 1000)
 		if err != nil {
+			log.Printf("list backups failed: marker=%q err=%v", marker, err)
 			writeError(w, http.StatusInternalServerError, "list objects failed")
 			return
 		}
@@ -276,6 +300,7 @@ func (s *Server) listBackups(w http.ResponseWriter) {
 			}
 			headers, err := s.client.HeadObject(obj.Key)
 			if err != nil {
+				log.Printf("head object skipped in list: key=%s err=%v", obj.Key, err)
 				continue
 			}
 			name := headers.Get("X-Oss-Meta-Backup-Name")
@@ -299,6 +324,7 @@ func (s *Server) listBackups(w http.ResponseWriter) {
 	}
 
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
+	log.Printf("list backups completed: count=%d", len(items))
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
@@ -316,16 +342,20 @@ func (s *Server) backupByIDEntry(w http.ResponseWriter, r *http.Request) {
 func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, apiPrefix+"/api/backups/"))
 	if id == "" {
+		log.Printf("download validation failed: empty backup id")
 		writeError(w, http.StatusBadRequest, "backup id is required")
 		return
 	}
+	log.Printf("download started: id=%s", id)
 	key, fileName, err := s.findObjectByID(id)
 	if err != nil {
+		log.Printf("download failed: id=%s not found err=%v", id, err)
 		writeError(w, http.StatusNotFound, "backup not found")
 		return
 	}
 	body, err := s.client.GetObject(key)
 	if err != nil {
+		log.Printf("download fetch failed: id=%s key=%s err=%v", id, key, err)
 		writeError(w, http.StatusInternalServerError, "fetch backup failed")
 		return
 	}
@@ -333,25 +363,32 @@ func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, fileName))
 	if _, err := io.Copy(w, body); err != nil {
-		log.Printf("stream backup failed: %v", err)
+		log.Printf("download stream failed: id=%s key=%s err=%v", id, key, err)
+		return
 	}
+	log.Printf("download completed: id=%s key=%s file_name=%s", id, key, fileName)
 }
 
 func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, apiPrefix+"/api/backups/"))
 	if id == "" {
+		log.Printf("delete validation failed: empty backup id")
 		writeError(w, http.StatusBadRequest, "backup id is required")
 		return
 	}
+	log.Printf("delete started: id=%s", id)
 	key, _, err := s.findObjectByID(id)
 	if err != nil {
+		log.Printf("delete failed: id=%s not found err=%v", id, err)
 		writeError(w, http.StatusNotFound, "backup not found")
 		return
 	}
 	if err := s.client.DeleteObject(key); err != nil {
+		log.Printf("delete failed: id=%s key=%s err=%v", id, key, err)
 		writeError(w, http.StatusInternalServerError, "delete backup failed")
 		return
 	}
+	log.Printf("delete completed: id=%s key=%s", id, key)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"id":      id,
 		"message": "backup deleted",
@@ -360,9 +397,11 @@ func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) findObjectByID(id string) (string, string, error) {
 	marker := ""
+	log.Printf("find object by id started: id=%s", id)
 	for {
 		res, err := s.client.ListObjects(s.cfg.OSSPrefix, marker, 1000)
 		if err != nil {
+			log.Printf("find object list failed: id=%s marker=%q err=%v", id, marker, err)
 			return "", "", err
 		}
 		for _, obj := range res.Contents {
@@ -371,11 +410,16 @@ func (s *Server) findObjectByID(id string) (string, string, error) {
 			}
 			base := path.Base(obj.Key)
 			if base == id || strings.TrimSuffix(base, path.Ext(base)) == id {
+				log.Printf("find object matched by filename: id=%s key=%s", id, obj.Key)
 				return obj.Key, base, nil
 			}
 			headers, err := s.client.HeadObject(obj.Key)
 			if err == nil && headers.Get("X-Oss-Meta-Backup-Id") == id {
+				log.Printf("find object matched by metadata: id=%s key=%s", id, obj.Key)
 				return obj.Key, base, nil
+			}
+			if err != nil {
+				log.Printf("find object head skipped: id=%s key=%s err=%v", id, obj.Key, err)
 			}
 		}
 		if !res.IsTruncated {
@@ -383,6 +427,7 @@ func (s *Server) findObjectByID(id string) (string, string, error) {
 		}
 		marker = res.NextMarker
 	}
+	log.Printf("find object not found: id=%s", id)
 	return "", "", errors.New("not found")
 }
 
@@ -483,6 +528,7 @@ func (c *OSSClient) doRequest(method, objectKey string, query url.Values, body i
 	}
 	req, err := http.NewRequest(method, u, body)
 	if err != nil {
+		log.Printf("oss new request failed: method=%s key=%s err=%v", method, objectKey, err)
 		return nil, err
 	}
 	req.Header.Set("Date", date)
@@ -493,7 +539,15 @@ func (c *OSSClient) doRequest(method, objectKey string, query url.Values, body i
 	for k, v := range extraHeaders {
 		req.Header.Set(k, v)
 	}
-	return c.http.Do(req)
+	resp, err := c.http.Do(req)
+	if err != nil {
+		log.Printf("oss request failed: method=%s key=%s url=%s err=%v", method, objectKey, u, err)
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		log.Printf("oss request returned error status: method=%s key=%s status=%d", method, objectKey, resp.StatusCode)
+	}
+	return resp, nil
 }
 
 func canonicalOSSHeaders(headers map[string]string) string {
