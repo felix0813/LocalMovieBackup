@@ -86,7 +86,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/api/backups", s.backupsEntry)
-	mux.HandleFunc("/api/backups/", s.downloadBackup)
+	mux.HandleFunc("/api/backups/", s.backupByIDEntry)
 
 	addr := ":" + cfg.Port
 	log.Printf("server started at %s", addr)
@@ -290,11 +290,18 @@ func (s *Server) listBackups(w http.ResponseWriter) {
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
-func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
+func (s *Server) backupByIDEntry(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		s.downloadBackup(w, r)
+	case http.MethodDelete:
+		s.deleteBackup(w, r)
+	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
 	}
+}
+
+func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/backups/"))
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "backup id is required")
@@ -316,6 +323,27 @@ func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, body); err != nil {
 		log.Printf("stream backup failed: %v", err)
 	}
+}
+
+func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/backups/"))
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "backup id is required")
+		return
+	}
+	key, _, err := s.findObjectByID(id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "backup not found")
+		return
+	}
+	if err := s.client.DeleteObject(key); err != nil {
+		writeError(w, http.StatusInternalServerError, "delete backup failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":      id,
+		"message": "backup deleted",
+	})
 }
 
 func (s *Server) findObjectByID(id string) (string, string, error) {
@@ -404,6 +432,19 @@ func (c *OSSClient) GetObject(key string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("get object failed: %d", resp.StatusCode)
 	}
 	return resp.Body, nil
+}
+
+func (c *OSSClient) DeleteObject(key string) error {
+	resp, err := c.doRequest(http.MethodDelete, key, nil, nil, "", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete object failed: %d %s", resp.StatusCode, string(b))
+	}
+	return nil
 }
 
 func (c *OSSClient) doRequest(method, objectKey string, query url.Values, body io.Reader, contentType string, extraHeaders map[string]string) (*http.Response, error) {

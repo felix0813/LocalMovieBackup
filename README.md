@@ -15,7 +15,8 @@
      - 上传到 OSS
 2. 查询备份列表：返回备份名称、创建时间、ID、大小等
 3. 下载备份：根据备份 ID 下载 zip 文件
-4. 不使用数据库，只依赖 OSS 对象和元数据
+4. 删除备份：根据备份 ID 删除 OSS 中的备份 zip
+5. 不使用数据库，只依赖 OSS 对象和元数据
 
 ## 环境变量
 
@@ -73,3 +74,20 @@ curl -L "http://localhost:8080/api/backups/20260413T120000Z" -o backup.zip
 ```
 
 > 说明：`id` 优先读取 OSS 对象元数据 `backup-id`，如果缺失则回退到对象文件名。
+
+### 4) 删除
+
+`DELETE /api/backups/{id}`
+
+```bash
+curl -X DELETE "http://localhost:8080/api/backups/20260413T120000Z"
+```
+
+成功时返回：
+
+```json
+{
+  "id": "20260413T120000Z",
+  "message": "backup deleted"
+}
+```
