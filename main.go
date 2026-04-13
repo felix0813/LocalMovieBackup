@@ -3,6 +3,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
+	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 )
 
 const apiPrefix = "/movieBackup"
@@ -47,7 +49,8 @@ type BackupItem struct {
 }
 
 type OSSClient struct {
-	bucket *oss.Bucket
+	client *oss.Client
+	bucket string
 }
 
 func main() {
@@ -272,32 +275,33 @@ func (s *Server) listBackups(w http.ResponseWriter) {
 			return
 		}
 		for _, obj := range res.Contents {
-			if strings.HasSuffix(obj.Key, "/") {
+			key := oss.ToString(obj.Key)
+			if strings.HasSuffix(key, "/") {
 				continue
 			}
-			headers, err := s.client.HeadObject(obj.Key)
+			headers, err := s.client.HeadObject(key)
 			if err != nil {
-				log.Printf("head object skipped in list: key=%s err=%v", obj.Key, err)
+				log.Printf("head object skipped in list: key=%s err=%v", key, err)
 				continue
 			}
 			name := headers.Get("X-Oss-Meta-Backup-Name")
 			if name == "" {
-				name = extractNameFromKey(path.Base(obj.Key))
+				name = extractNameFromKey(path.Base(key))
 			}
 			id := headers.Get("X-Oss-Meta-Backup-Id")
 			if id == "" {
-				id = strings.TrimSuffix(path.Base(obj.Key), path.Ext(obj.Key))
+				id = strings.TrimSuffix(path.Base(key), path.Ext(key))
 			}
 			createdAt := headers.Get("X-Oss-Meta-Backup-Created-At")
 			if createdAt == "" {
-				createdAt = obj.LastModified
+				createdAt = oss.ToTime(obj.LastModified).UTC().Format(time.RFC3339)
 			}
-			items = append(items, BackupItem{ID: id, Name: name, CreatedAt: createdAt, Size: obj.Size, FileName: path.Base(obj.Key)})
+			items = append(items, BackupItem{ID: id, Name: name, CreatedAt: createdAt, Size: obj.Size, FileName: path.Base(key)})
 		}
 		if !res.IsTruncated {
 			break
 		}
-		marker = res.NextMarker
+		marker = oss.ToString(res.NextMarker)
 	}
 
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
@@ -382,27 +386,28 @@ func (s *Server) findObjectByID(id string) (string, string, error) {
 			return "", "", err
 		}
 		for _, obj := range res.Contents {
-			if strings.HasSuffix(obj.Key, "/") {
+			key := oss.ToString(obj.Key)
+			if strings.HasSuffix(key, "/") {
 				continue
 			}
-			base := path.Base(obj.Key)
+			base := path.Base(key)
 			if base == id || strings.TrimSuffix(base, path.Ext(base)) == id {
-				log.Printf("find object matched by filename: id=%s key=%s", id, obj.Key)
-				return obj.Key, base, nil
+				log.Printf("find object matched by filename: id=%s key=%s", id, key)
+				return key, base, nil
 			}
-			headers, err := s.client.HeadObject(obj.Key)
+			headers, err := s.client.HeadObject(key)
 			if err == nil && headers.Get("X-Oss-Meta-Backup-Id") == id {
-				log.Printf("find object matched by metadata: id=%s key=%s", id, obj.Key)
-				return obj.Key, base, nil
+				log.Printf("find object matched by metadata: id=%s key=%s", id, key)
+				return key, base, nil
 			}
 			if err != nil {
-				log.Printf("find object head skipped: id=%s key=%s err=%v", id, obj.Key, err)
+				log.Printf("find object head skipped: id=%s key=%s err=%v", id, key, err)
 			}
 		}
 		if !res.IsTruncated {
 			break
 		}
-		marker = res.NextMarker
+		marker = oss.ToString(res.NextMarker)
 	}
 	log.Printf("find object not found: id=%s", id)
 	return "", "", errors.New("not found")
@@ -410,47 +415,77 @@ func (s *Server) findObjectByID(id string) (string, string, error) {
 
 func NewOSSClient(cfg Config) (*OSSClient, error) {
 	endpoint := strings.TrimSpace(cfg.OSSEndpoint)
-	endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
-	client, err := oss.New("https://"+endpoint, cfg.OSSAccessKeyID, cfg.OSSAccessSecret, oss.Timeout(10, 60))
-	if err != nil {
-		return nil, err
+	if endpoint == "" {
+		return nil, errors.New("oss endpoint is required")
 	}
-	bucket, err := client.Bucket(cfg.OSSBucket)
-	if err != nil {
-		return nil, err
-	}
-	return &OSSClient{bucket: bucket}, nil
+
+	os.Setenv("OSS_ACCESS_KEY_ID", cfg.OSSAccessKeyID)
+	os.Setenv("OSS_ACCESS_KEY_SECRET", cfg.OSSAccessSecret)
+
+	ossCfg := oss.LoadDefaultConfig().
+		WithCredentialsProvider(credentials.NewEnvironmentVariableCredentialsProvider()).
+		WithEndpoint(endpoint)
+	client := oss.NewClient(ossCfg)
+
+	return &OSSClient{client: client, bucket: cfg.OSSBucket}, nil
 }
 
 func (c *OSSClient) ListObjects(prefix, marker string, maxKeys int) (*oss.ListObjectsResult, error) {
-	options := []oss.Option{oss.Prefix(prefix), oss.MaxKeys(maxKeys)}
-	if marker != "" {
-		options = append(options, oss.Marker(marker))
+	request := &oss.ListObjectsRequest{
+		Bucket:  oss.Ptr(c.bucket),
+		Prefix:  oss.Ptr(prefix),
+		MaxKeys: int32(maxKeys),
 	}
-	return c.bucket.ListObjects(options...)
+	if marker != "" {
+		request.Marker = oss.Ptr(marker)
+	}
+	return c.client.ListObjects(context.TODO(), request)
 }
 
 func (c *OSSClient) PutObject(key string, body []byte, contentType string, headers map[string]string) error {
-	options := make([]oss.Option, 0, len(headers)+1)
+	request := &oss.PutObjectRequest{
+		Bucket:   oss.Ptr(c.bucket),
+		Key:      oss.Ptr(key),
+		Body:     bytes.NewReader(body),
+		Metadata: make(map[string]string),
+	}
 	if contentType != "" {
-		options = append(options, oss.ContentType(contentType))
+		request.ContentType = oss.Ptr(contentType)
 	}
 	for k, v := range headers {
-		options = append(options, oss.SetHeader(k, v))
+		metaKey := strings.TrimPrefix(strings.ToLower(k), "x-oss-meta-")
+		request.Metadata[metaKey] = v
 	}
-	return c.bucket.PutObject(key, bytes.NewReader(body), options...)
+	_, err := c.client.PutObject(context.TODO(), request)
+	return err
 }
 
 func (c *OSSClient) HeadObject(key string) (http.Header, error) {
-	return c.bucket.GetObjectMeta(key)
+	res, err := c.client.HeadObject(context.TODO(), &oss.HeadObjectRequest{Bucket: oss.Ptr(c.bucket), Key: oss.Ptr(key)})
+	if err != nil {
+		return nil, err
+	}
+	h := http.Header{}
+	for k, v := range res.Metadata {
+		h.Set("X-Oss-Meta-"+k, v)
+	}
+	if v := oss.ToTime(res.LastModified); !v.IsZero() {
+		h.Set("Last-Modified", v.UTC().Format(http.TimeFormat))
+	}
+	return h, nil
 }
 
 func (c *OSSClient) GetObject(key string) (io.ReadCloser, error) {
-	return c.bucket.GetObject(key)
+	res, err := c.client.GetObject(context.TODO(), &oss.GetObjectRequest{Bucket: oss.Ptr(c.bucket), Key: oss.Ptr(key)})
+	if err != nil {
+		return nil, err
+	}
+	return res.Body, nil
 }
 
 func (c *OSSClient) DeleteObject(key string) error {
-	return c.bucket.DeleteObject(key)
+	_, err := c.client.DeleteObject(context.TODO(), &oss.DeleteObjectRequest{Bucket: oss.Ptr(c.bucket), Key: oss.Ptr(key)})
+	return err
 }
 
 func (c *OSSClient) CheckConnection(prefix string) error {
