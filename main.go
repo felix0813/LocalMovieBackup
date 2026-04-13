@@ -3,18 +3,13 @@ package main
 import (
 	"archive/zip"
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha1"
-	"encoding/base64"
 	"encoding/json"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -22,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
 
 const apiPrefix = "/movieBackup"
@@ -50,24 +47,7 @@ type BackupItem struct {
 }
 
 type OSSClient struct {
-	endpoint  string
-	bucket    string
-	accessKey string
-	secretKey string
-	http      *http.Client
-}
-
-type listBucketResult struct {
-	XMLName     xml.Name  `xml:"ListBucketResult"`
-	Contents    []content `xml:"Contents"`
-	IsTruncated bool      `xml:"IsTruncated"`
-	NextMarker  string    `xml:"NextMarker"`
-}
-
-type content struct {
-	Key          string `xml:"Key"`
-	LastModified string `xml:"LastModified"`
-	Size         int64  `xml:"Size"`
+	bucket *oss.Bucket
 }
 
 func main() {
@@ -76,12 +56,9 @@ func main() {
 		log.Fatalf("load config failed: %v", err)
 	}
 
-	client := &OSSClient{
-		endpoint:  strings.TrimPrefix(strings.TrimPrefix(cfg.OSSEndpoint, "https://"), "http://"),
-		bucket:    cfg.OSSBucket,
-		accessKey: cfg.OSSAccessKeyID,
-		secretKey: cfg.OSSAccessSecret,
-		http:      &http.Client{Timeout: 60 * time.Second},
+	client, err := NewOSSClient(cfg)
+	if err != nil {
+		log.Fatalf("init oss client failed: %v", err)
 	}
 
 	s := &Server{cfg: cfg, client: client}
@@ -431,145 +408,54 @@ func (s *Server) findObjectByID(id string) (string, string, error) {
 	return "", "", errors.New("not found")
 }
 
-func (c *OSSClient) ListObjects(prefix, marker string, maxKeys int) (*listBucketResult, error) {
-	q := url.Values{}
-	q.Set("prefix", prefix)
-	q.Set("max-keys", strconv.Itoa(maxKeys))
-	if marker != "" {
-		q.Set("marker", marker)
-	}
-	resp, err := c.doRequest(http.MethodGet, "", q, nil, "", nil)
+func NewOSSClient(cfg Config) (*OSSClient, error) {
+	endpoint := strings.TrimSpace(cfg.OSSEndpoint)
+	endpoint = strings.TrimPrefix(strings.TrimPrefix(endpoint, "https://"), "http://")
+	client, err := oss.New("https://"+endpoint, cfg.OSSAccessKeyID, cfg.OSSAccessSecret, oss.Timeout(10, 60))
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("oss list failed: %d %s", resp.StatusCode, string(b))
-	}
-	var result listBucketResult
-	if err := xml.NewDecoder(resp.Body).Decode(&result); err != nil {
+	bucket, err := client.Bucket(cfg.OSSBucket)
+	if err != nil {
 		return nil, err
 	}
-	return &result, nil
+	return &OSSClient{bucket: bucket}, nil
+}
+
+func (c *OSSClient) ListObjects(prefix, marker string, maxKeys int) (*oss.ListObjectsResult, error) {
+	options := []oss.Option{oss.Prefix(prefix), oss.MaxKeys(maxKeys)}
+	if marker != "" {
+		options = append(options, oss.Marker(marker))
+	}
+	return c.bucket.ListObjects(options...)
 }
 
 func (c *OSSClient) PutObject(key string, body []byte, contentType string, headers map[string]string) error {
-	resp, err := c.doRequest(http.MethodPut, key, nil, bytes.NewReader(body), contentType, headers)
-	if err != nil {
-		return err
+	options := make([]oss.Option, 0, len(headers)+1)
+	if contentType != "" {
+		options = append(options, oss.ContentType(contentType))
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("oss put failed: %d %s", resp.StatusCode, string(b))
+	for k, v := range headers {
+		options = append(options, oss.SetHeader(k, v))
 	}
-	return nil
+	return c.bucket.PutObject(key, bytes.NewReader(body), options...)
 }
 
 func (c *OSSClient) HeadObject(key string) (http.Header, error) {
-	resp, err := c.doRequest(http.MethodHead, key, nil, nil, "", nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("head object failed: %d", resp.StatusCode)
-	}
-	return resp.Header, nil
+	return c.bucket.GetObjectMeta(key)
 }
 
 func (c *OSSClient) GetObject(key string) (io.ReadCloser, error) {
-	resp, err := c.doRequest(http.MethodGet, key, nil, nil, "", nil)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
-		return nil, fmt.Errorf("get object failed: %d", resp.StatusCode)
-	}
-	return resp.Body, nil
+	return c.bucket.GetObject(key)
 }
 
 func (c *OSSClient) DeleteObject(key string) error {
-	resp, err := c.doRequest(http.MethodDelete, key, nil, nil, "", nil)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete object failed: %d %s", resp.StatusCode, string(b))
-	}
-	return nil
+	return c.bucket.DeleteObject(key)
 }
 
 func (c *OSSClient) CheckConnection(prefix string) error {
 	_, err := c.ListObjects(prefix, "", 1)
 	return err
-}
-
-func (c *OSSClient) doRequest(method, objectKey string, query url.Values, body io.Reader, contentType string, extraHeaders map[string]string) (*http.Response, error) {
-	date := time.Now().UTC().Format(http.TimeFormat)
-	canonicalizedOSSHeaders := canonicalOSSHeaders(extraHeaders)
-	canonicalizedResource := "/" + c.bucket + "/" + objectKey
-	if query != nil && len(query) > 0 {
-		canonicalizedResource += "?" + query.Encode()
-	}
-
-	stringToSign := method + "\n\n" + contentType + "\n" + date + "\n" + canonicalizedOSSHeaders + canonicalizedResource
-	h := hmac.New(sha1.New, []byte(c.secretKey))
-	h.Write([]byte(stringToSign))
-	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-	u := "https://" + c.bucket + "." + c.endpoint + "/" + objectKey
-	if query != nil && len(query) > 0 {
-		u += "?" + query.Encode()
-	}
-	req, err := http.NewRequest(method, u, body)
-	if err != nil {
-		log.Printf("oss new request failed: method=%s key=%s err=%v", method, objectKey, err)
-		return nil, err
-	}
-	req.Header.Set("Date", date)
-	req.Header.Set("Authorization", "OSS "+c.accessKey+":"+signature)
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	for k, v := range extraHeaders {
-		req.Header.Set(k, v)
-	}
-	resp, err := c.http.Do(req)
-	if err != nil {
-		log.Printf("oss request failed: method=%s key=%s url=%s err=%v", method, objectKey, u, err)
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		log.Printf("oss request returned error status: method=%s key=%s status=%d", method, objectKey, resp.StatusCode)
-	}
-	return resp, nil
-}
-
-func canonicalOSSHeaders(headers map[string]string) string {
-	if len(headers) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(headers))
-	for k := range headers {
-		lk := strings.ToLower(strings.TrimSpace(k))
-		if strings.HasPrefix(lk, "x-oss-") {
-			keys = append(keys, lk)
-		}
-	}
-	sort.Strings(keys)
-	lines := make([]string, 0, len(keys))
-	for _, k := range keys {
-		lines = append(lines, k+":"+strings.TrimSpace(headers[k]))
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	return strings.Join(lines, "\n") + "\n"
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
