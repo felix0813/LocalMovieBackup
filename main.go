@@ -24,6 +24,8 @@ import (
 	"time"
 )
 
+const apiPrefix = "/movieBackup"
+
 type Config struct {
 	Port            string
 	OSSEndpoint     string
@@ -84,9 +86,9 @@ func main() {
 
 	s := &Server{cfg: cfg, client: client}
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", s.healthz)
-	mux.HandleFunc("/api/backups", s.backupsEntry)
-	mux.HandleFunc("/api/backups/", s.backupByIDEntry)
+	mux.HandleFunc(apiPrefix+"/healthz", s.healthz)
+	mux.HandleFunc(apiPrefix+"/api/backups", s.backupsEntry)
+	mux.HandleFunc(apiPrefix+"/api/backups/", s.backupByIDEntry)
 
 	addr := ":" + cfg.Port
 	log.Printf("server started at %s", addr)
@@ -126,7 +128,17 @@ func loadConfig() (Config, error) {
 }
 
 func (s *Server) healthz(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	if err := s.client.CheckConnection(s.cfg.OSSPrefix); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "degraded",
+			"oss":    "unreachable",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "ok",
+		"oss":    "reachable",
+	})
 }
 
 func (s *Server) backupsEntry(w http.ResponseWriter, r *http.Request) {
@@ -302,7 +314,7 @@ func (s *Server) backupByIDEntry(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/backups/"))
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, apiPrefix+"/api/backups/"))
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "backup id is required")
 		return
@@ -326,7 +338,7 @@ func (s *Server) downloadBackup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteBackup(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/api/backups/"))
+	id := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, apiPrefix+"/api/backups/"))
 	if id == "" {
 		writeError(w, http.StatusBadRequest, "backup id is required")
 		return
@@ -445,6 +457,11 @@ func (c *OSSClient) DeleteObject(key string) error {
 		return fmt.Errorf("delete object failed: %d %s", resp.StatusCode, string(b))
 	}
 	return nil
+}
+
+func (c *OSSClient) CheckConnection(prefix string) error {
+	_, err := c.ListObjects(prefix, "", 1)
+	return err
 }
 
 func (c *OSSClient) doRequest(method, objectKey string, query url.Values, body io.Reader, contentType string, extraHeaders map[string]string) (*http.Response, error) {

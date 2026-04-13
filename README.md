@@ -39,9 +39,23 @@ go run .
 
 ## API
 
+> 所有接口统一前缀：`/movieBackup`
+
+### 0) 健康检查
+
+`GET /movieBackup/healthz`
+
+会同时检查服务可用性和 OSS 连通性：
+- OSS 可连接：返回 `200`
+- OSS 不可连接：返回 `503`
+
+```bash
+curl http://localhost:8080/movieBackup/healthz
+```
+
 ### 1) 上传备份
 
-`POST /api/backups`
+`POST /movieBackup/api/backups`
 
 `multipart/form-data` 字段：
 - `name`：备份名称
@@ -51,7 +65,7 @@ go run .
 示例：
 
 ```bash
-curl -X POST http://localhost:8080/api/backups \
+curl -X POST http://localhost:8080/movieBackup/api/backups \
   -F "name=my-backup" \
   -F "sqlite=@./app.db" \
   -F "json=@./meta.json"
@@ -59,28 +73,28 @@ curl -X POST http://localhost:8080/api/backups \
 
 ### 2) 列表
 
-`GET /api/backups`
+`GET /movieBackup/api/backups`
 
 ```bash
-curl http://localhost:8080/api/backups
+curl http://localhost:8080/movieBackup/api/backups
 ```
 
 ### 3) 下载
 
-`GET /api/backups/{id}`
+`GET /movieBackup/api/backups/{id}`
 
 ```bash
-curl -L "http://localhost:8080/api/backups/20260413T120000Z" -o backup.zip
+curl -L "http://localhost:8080/movieBackup/api/backups/20260413T120000Z" -o backup.zip
 ```
 
 > 说明：`id` 优先读取 OSS 对象元数据 `backup-id`，如果缺失则回退到对象文件名。
 
 ### 4) 删除
 
-`DELETE /api/backups/{id}`
+`DELETE /movieBackup/api/backups/{id}`
 
 ```bash
-curl -X DELETE "http://localhost:8080/api/backups/20260413T120000Z"
+curl -X DELETE "http://localhost:8080/movieBackup/api/backups/20260413T120000Z"
 ```
 
 成功时返回：
