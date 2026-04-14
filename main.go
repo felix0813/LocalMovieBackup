@@ -25,6 +25,8 @@ import (
 
 const apiPrefix = "/movieBackup"
 
+var backupNamePattern = regexp.MustCompile(`^[\p{L}\p{N}_\- ]{1,64}$`)
+
 type Config struct {
 	Port            string
 	OSSEndpoint     string
@@ -161,7 +163,7 @@ func (s *Server) uploadBackup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "name is required")
 		return
 	}
-	if !regexp.MustCompile(`^[\w\-\u4e00-\u9fa5 ]{1,64}$`).MatchString(name) {
+	if !backupNamePattern.MatchString(name) {
 		log.Printf("upload validation failed: invalid name=%q", name)
 		writeError(w, http.StatusBadRequest, "name must be 1-64 chars and contains letters, numbers, spaces, -, _")
 		return
