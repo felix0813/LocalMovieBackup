@@ -555,7 +555,7 @@ func inferOSSRegion(endpoint string) (string, error) {
 }
 func sanitizeName(v string) string {
 	v = strings.TrimSpace(strings.ReplaceAll(v, " ", "-"))
-	v = regexp.MustCompile(`[^a-zA-Z0-9_\-\u4e00-\u9fa5]`).ReplaceAllString(v, "")
+	v = regexp.MustCompile(`[^a-zA-Z0-9_\-\p{Han}]`).ReplaceAllString(v, "")
 	if v == "" {
 		return "backup"
 	}
